@@ -1733,6 +1733,159 @@ app.get('/api/orders/admin/order-stats', async (req, res) => {
   }
 });
 
+// ✅ ADMIN UPDATE ORDER BY ID
+app.put('/api/orders/admin/order/update-by-id/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+
+    console.log(`📝 Admin: Updating order ${id} with:`, updateData);
+
+    const Order = require('./models/Order');
+
+    // Find and update the order
+    const updatedOrder = await Order.findByIdAndUpdate(
+      id,
+      {
+        ...updateData,
+        updatedAt: new Date()
+      },
+      {
+        new: true,  // Return the updated document
+        runValidators: true  // Run model validators
+      }
+    );
+
+    if (!updatedOrder) {
+      console.error(`❌ Admin: Order ${id} not found`);
+      return res.status(404).json({
+        success: false,
+        error: 'Order not found'
+      });
+    }
+
+    console.log(`✅ Admin: Order ${id} updated successfully`);
+
+    res.json({
+      success: true,
+      message: 'Order updated successfully',
+      data: updatedOrder
+    });
+
+  } catch (error) {
+    console.error('❌ Admin: Error updating order:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update order',
+      details: error.message
+    });
+  }
+});
+
+// ✅ DIRECT ORDER PLACEMENT (Fix for "User data not found")
+app.post(['/api/orders/create', '/api/orders/place-order', '/api/orders'], async (req, res) => {
+  try {
+    console.log('🛍️ DIRECT ORDER: Received order placement request');
+    
+    // 1. Auth Check
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith("Bearer ")) {
+      return res.status(401).json({ success: false, error: "No token provided" });
+    }
+    
+    const token = authHeader.split(" ")[1];
+    let userId;
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+      userId = decoded.id;
+    } catch (err) {
+      return res.status(401).json({ success: false, error: "Invalid token" });
+    }
+
+    // 2. Get User Data
+    const Registration = require("./models/user/Registration");
+    const user = await Registration.findById(userId);
+    
+    if (!user) {
+      console.error(`❌ DIRECT ORDER: User not found for ID ${userId}`);
+      return res.status(404).json({ success: false, error: "User data not found" });
+    }
+
+    console.log(`👤 DIRECT ORDER: User verified: ${user.name} (${user.phoneNumber})`);
+
+    // 3. Get Order Data
+    const { products, totalAmount, deliveryAddress, paymentMethod } = req.body;
+    
+    if (!products || !Array.isArray(products) || products.length === 0) {
+      return res.status(400).json({ success: false, error: "No products provided" });
+    }
+
+    // 4. Generate Order ID
+    const Counter = require("./models/user/customerId");
+    let counter = await Counter.findOne({ _id: "orderId" });
+    if (!counter) {
+        counter = new Counter({ _id: "orderId", sequence: 100000 });
+        await counter.save();
+    }
+    
+    const updatedCounter = await Counter.findOneAndUpdate(
+      { _id: "orderId" },
+      { $inc: { sequence: 1 } },
+      { new: true }
+    );
+    
+    const orderId = `ORD${updatedCounter.sequence}`;
+
+    // 5. Create Order
+    const Order = require('./models/Order');
+    const newOrder = new Order({
+      orderId,
+      customerId: user.customerId || "N/A",
+      customerName: user.name,
+      customerPhone: user.phoneNumber,
+      customerEmail: user.email,
+      customerAddress: user.address,
+      userId: user._id,
+      products: products,
+      totalAmount,
+      deliveryAddress: deliveryAddress || user.address,
+      paymentMethod: paymentMethod || 'COD',
+      status: 'order_confirmed',
+      orderDate: new Date(),
+      createdAt: new Date()
+    });
+
+    await newOrder.save();
+    console.log(`✅ DIRECT ORDER: Order ${orderId} created successfully`);
+
+    // 6. Notify Admin via Socket
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('newOrder', {
+        orderId,
+        customerName: user.name,
+        totalAmount,
+        timestamp: new Date()
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: "Order placed successfully",
+      order: newOrder,
+      orderId
+    });
+
+  } catch (error) {
+    console.error('❌ DIRECT ORDER error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to place order',
+      details: error.message
+    });
+  }
+});
+
 // ✅ MODELS
 const Registration = require("./models/user/Registration");
 const Counter = require("./models/user/customerId");
@@ -1909,8 +2062,13 @@ app.post("/api/wallet/add-money", authenticateToken, async (req, res) => {
 
 app.get("/api/users/profile", authenticateToken, async (req, res) => {
   try {
+    console.log(`👤 PROFILE: Fetching data for ${req.userId}`);
     const user = await Registration.findById(req.userId);
     if (!user) return res.status(404).json({ success: false, error: "User not found" });
+    if (!user) {
+      console.error(`❌ PROFILE: User not found in DB for ID ${req.userId}`);
+      return res.status(404).json({ success: false, error: "User not found" });
+    }
 
     const backendUrl = process.env.BACKEND_URL || "http://localhost:5001";
     const profilePicture = user.profilePicture
